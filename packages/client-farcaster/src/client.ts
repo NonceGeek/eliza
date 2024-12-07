@@ -1,171 +1,116 @@
 import { IAgentRuntime } from "@ai16z/eliza";
-import { NeynarAPIClient, isApiErrorResponse } from "@neynar/nodejs-sdk";
-import { NeynarCastResponse, Cast, Profile, FidRequest, CastId } from "./types";
+import {
+    CastAddMessage,
+    CastId,
+    FidRequest,
+    getInsecureHubRpcClient,
+    getSSLHubRpcClient,
+    HubRpcClient,
+    isCastAddMessage,
+    isUserDataAddMessage,
+    Message,
+    MessagesResponse,
+} from "@farcaster/hub-nodejs";
+import { Cast, Profile } from "./types";
+import { toHex } from "viem";
+import { populateMentions } from "./utils";
 
 export class FarcasterClient {
     runtime: IAgentRuntime;
-    neynar: NeynarAPIClient;
-    signerUuid: string;
+    farcaster: HubRpcClient;
+
     cache: Map<string, any>;
-    lastInteractionTimestamp: Date;
 
     constructor(opts: {
         runtime: IAgentRuntime;
         url: string;
         ssl: boolean;
-        neynar: NeynarAPIClient;
-        signerUuid: string;
         cache: Map<string, any>;
     }) {
         this.cache = opts.cache;
         this.runtime = opts.runtime;
-        this.neynar = opts.neynar;
-        this.signerUuid = opts.signerUuid;
-        this.lastInteractionTimestamp = new Date();
+        this.farcaster = opts.ssl
+            ? getSSLHubRpcClient(opts.url)
+            : getInsecureHubRpcClient(opts.url);
     }
 
-    async loadCastFromNeynarResponse(neynarResponse: any): Promise<Cast> {
-        const profile = await this.getProfile(neynarResponse.author.fid);
-        return {
-            hash: neynarResponse.hash,
-            authorFid: neynarResponse.author.fid,
-            text: neynarResponse.text,
-            profile,
-            ...(neynarResponse.parent_hash
-                ? {
-                      inReplyTo: {
-                          hash: neynarResponse.parent_hash,
-                          fid: neynarResponse.parent_author.fid,
-                      },
-                  }
-                : {}),
-            timestamp: new Date(neynarResponse.timestamp),
-        };
-    }
+    async submitMessage(cast: Message, retryTimes?: number): Promise<void> {
+        const result = await this.farcaster.submitMessage(cast);
 
-    async publishCast(
-        cast: string,
-        parentCastId: CastId | undefined,
-        retryTimes?: number
-    ): Promise<NeynarCastResponse | undefined> {
-        try {
-            const result = await this.neynar.publishCast({
-                signerUuid: this.signerUuid,
-                text: cast,
-                parent: parentCastId?.hash,
-            });
-            if (result.success) {
-                return {
-                    hash: result.cast.hash,
-                    authorFid: result.cast.author.fid,
-                    text: result.cast.text,
-                };
-            }
-        } catch (err) {
-            if (isApiErrorResponse(err)) {
-                console.log(err.response.data);
-                throw err.response.data;
-            } else {
-                throw err;
-                console.log(err);
-            }
+        if (result.isErr()) {
+            throw result.error;
         }
     }
 
-    async getCast(castHash: string): Promise<Cast> {
+    async loadCastFromMessage(message: CastAddMessage): Promise<Cast> {
+        const profileMap = {};
+
+        const profile = await this.getProfile(message.data.fid);
+
+        profileMap[message.data.fid] = profile;
+
+        for (const mentionId of message.data.castAddBody.mentions) {
+            if (profileMap[mentionId]) continue;
+            profileMap[mentionId] = await this.getProfile(mentionId);
+        }
+
+        const text = populateMentions(
+            message.data.castAddBody.text,
+            message.data.castAddBody.mentions,
+            message.data.castAddBody.mentionsPositions,
+            profileMap
+        );
+
+        return {
+            id: toHex(message.hash),
+            message,
+            text,
+            profile,
+        };
+    }
+
+    async getCast(castId: CastId): Promise<Message> {
+        const castHash = toHex(castId.hash);
+
         if (this.cache.has(`farcaster/cast/${castHash}`)) {
             return this.cache.get(`farcaster/cast/${castHash}`);
         }
 
-        const response = await this.neynar.lookupCastByHashOrWarpcastUrl({
-            identifier: castHash,
-            type: "hash",
-        });
-        const cast = {
-            hash: response.cast.hash,
-            //parentHash: cast.parent_hash,
-            authorFid: response.cast.author.fid,
-            text: response.cast.text,
-            profile: {
-                fid: response.cast.author.fid,
-                name: response.cast.author.display_name || "anon",
-                username: response.cast.author.username,
-            },
-            ...(response.cast.parent_hash
-                ? {
-                      inReplyTo: {
-                          hash: response.cast.parent_hash,
-                          fid: response.cast.parent_author.fid,
-                      },
-                  }
-                : {}),
-            timestamp: new Date(response.cast.timestamp),
-        };
+        const cast = await this.farcaster.getCast(castId);
+
+        if (cast.isErr()) {
+            throw cast.error;
+        }
 
         this.cache.set(`farcaster/cast/${castHash}`, cast);
 
-        return cast;
+        return cast.value;
     }
 
-    async getCastsByFid(request: FidRequest): Promise<Cast[]> {
-        const timeline: Cast[] = [];
+    async getCastsByFid(request: FidRequest): Promise<MessagesResponse> {
+        const cast = await this.farcaster.getCastsByFid(request);
+        if (cast.isErr()) {
+            throw cast.error;
+        }
 
-        const response = await this.neynar.fetchCastsForUser({
-            fid: request.fid,
-            limit: request.pageSize,
-        });
-        //console.log(response);
-        response.casts.map((cast) => {
-            this.cache.set(`farcaster/cast/${cast.hash}`, cast);
-            timeline.push({
-                hash: cast.hash,
-                //parentHash: cast.parent_hash,
-                authorFid: cast.author.fid,
-                text: cast.text,
-                profile: {
-                    fid: cast.author.fid,
-                    name: cast.author.display_name || "anon",
-                    username: cast.author.username,
-                },
-                timestamp: new Date(cast.timestamp),
-            });
+        cast.value.messages.map((cast) => {
+            this.cache.set(`farcaster/cast/${toHex(cast.hash)}`, cast);
         });
 
-        return timeline;
+        return cast.value;
     }
 
-    async getMentions(request: FidRequest): Promise<Cast[]> {
-        const neynarMentionsResponse = await this.neynar.fetchAllNotifications({
-            fid: request.fid,
-            type: ["mentions", "replies"],
-        });
-        const mentions: Cast[] = [];
+    async getMentions(request: FidRequest): Promise<MessagesResponse> {
+        const cast = await this.farcaster.getCastsByMention(request);
+        if (cast.isErr()) {
+            throw cast.error;
+        }
 
-        neynarMentionsResponse.notifications.map((notification) => {
-            const cast = {
-                hash: notification.cast!.hash,
-                authorFid: notification.cast!.author.fid,
-                text: notification.cast!.text,
-                profile: {
-                    fid: notification.cast!.author.fid,
-                    name: notification.cast!.author.display_name || "anon",
-                    username: notification.cast!.author.username,
-                },
-                ...(notification.cast!.parent_hash
-                    ? {
-                          inReplyTo: {
-                              hash: notification.cast!.parent_hash,
-                              fid: notification.cast!.parent_author.fid,
-                          },
-                      }
-                    : {}),
-                timestamp: new Date(notification.cast!.timestamp),
-            };
-            mentions.push(cast);
-            this.cache.set(`farcaster/cast/${cast.hash}`, cast);
+        cast.value.messages.map((cast) => {
+            this.cache.set(`farcaster/cast/${toHex(cast.hash)}`, cast);
         });
 
-        return mentions;
+        return cast.value;
     }
 
     async getProfile(fid: number): Promise<Profile> {
@@ -173,18 +118,19 @@ export class FarcasterClient {
             return this.cache.get(`farcaster/profile/${fid}`) as Profile;
         }
 
-        const result = await this.neynar.fetchBulkUsers({ fids: [fid] });
-        if (!result.users || result.users.length < 1) {
-            console.log("getUserDataByFid ERROR");
+        const result = await this.farcaster.getUserDataByFid({
+            fid: fid,
+            reverse: true,
+        });
 
-            throw "getUserDataByFid ERROR";
+        if (result.isErr()) {
+            throw result.error;
         }
-
-        const neynarUserProfile = result.users[0];
 
         const profile: Profile = {
             fid,
             name: "",
+            signer: "0x",
             username: "",
         };
 
@@ -199,10 +145,21 @@ export class FarcasterClient {
             // 9: "github",
         } as const;
 
-        profile.name = neynarUserProfile.display_name!;
-        profile.username = neynarUserProfile.username;
-        profile.bio = neynarUserProfile.profile.bio.text;
-        profile.pfp = neynarUserProfile.pfp_url;
+        for (const message of result.value.messages) {
+            if (isUserDataAddMessage(message)) {
+                if (message.data.userDataBody.type in userDataBodyType) {
+                    const prop =
+                        userDataBodyType[message.data.userDataBody.type];
+                    profile[prop] = message.data.userDataBody.value;
+                }
+            }
+        }
+
+        const [lastMessage] = result.value.messages;
+
+        if (lastMessage) {
+            profile.signer = toHex(lastMessage.signer);
+        }
 
         this.cache.set(`farcaster/profile/${fid}`, profile);
 
@@ -217,15 +174,20 @@ export class FarcasterClient {
 
         const results = await this.getCastsByFid(request);
 
-        for (const cast of results) {
-            this.cache.set(`farcaster/cast/${cast.hash}`, cast);
-            timeline.push(cast);
+        for (const message of results.messages) {
+            if (isCastAddMessage(message)) {
+                this.cache.set(
+                    `farcaster/cast/${toHex(message.hash)}`,
+                    message
+                );
+
+                timeline.push(await this.loadCastFromMessage(message));
+            }
         }
 
         return {
             timeline,
-            //TODO implement paging
-            //nextPageToken: results.nextPageToken,
+            nextPageToken: results.nextPageToken,
         };
     }
 }

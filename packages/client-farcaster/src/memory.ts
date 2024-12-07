@@ -1,3 +1,4 @@
+import { isCastAddMessage } from "@farcaster/hub-nodejs";
 import {
     elizaLogger,
     getEmbeddingZeroVector,
@@ -20,16 +21,16 @@ export function createCastMemory({
     runtime: IAgentRuntime;
     cast: Cast;
 }): Memory {
-    const inReplyTo =  cast.inReplyTo
+    const inReplyTo = cast.message.data.castAddBody.parentCastId
         ? castUuid({
-            hash: toHex(cast.inReplyTo.hash),
-            agentId: runtime.agentId,
+              hash: toHex(cast.message.data.castAddBody.parentCastId.hash),
+              agentId: runtime.agentId,
           })
         : undefined;
 
     return {
         id: castUuid({
-            hash: cast.hash,
+            hash: cast.id,
             agentId: runtime.agentId,
         }),
         agentId: runtime.agentId,
@@ -39,10 +40,11 @@ export function createCastMemory({
             source: "farcaster",
             url: "",
             inReplyTo,
-            hash: cast.hash,
+            hash: cast.id,
         },
         roomId,
         embedding: getEmbeddingZeroVector(),
+        createdAt: cast.message.data.timestamp * 1000,
     };
 }
 
@@ -54,28 +56,29 @@ export async function buildConversationThread({
     cast: Cast;
     runtime: IAgentRuntime;
     client: FarcasterClient;
-}): Promise<Cast[]> {
+}): Promise<void> {
     const thread: Cast[] = [];
     const visited: Set<string> = new Set();
+
     async function processThread(currentCast: Cast) {
-        if (visited.has(currentCast.hash)) {
+        if (visited.has(cast.id)) {
             return;
         }
 
-        visited.add(currentCast.hash);
+        visited.add(cast.id);
 
         const roomId = castUuid({
-            hash: currentCast.hash,
+            hash: currentCast.id,
             agentId: runtime.agentId,
         });
 
-        // Check if the current cast has already been saved
+        // Check if the current tweet has already been saved
         const memory = await runtime.messageManager.getMemoryById(roomId);
 
         if (!memory) {
-            elizaLogger.log("Creating memory for cast", currentCast.hash);
+            elizaLogger.log("Creating memory for cast", cast.id);
 
-            const userId = stringToUuid(currentCast.profile.username);
+            const userId = stringToUuid(cast.profile.username);
 
             await runtime.ensureConnection(
                 userId,
@@ -96,12 +99,17 @@ export async function buildConversationThread({
 
         thread.unshift(currentCast);
 
-        if (currentCast.inReplyTo) {
-            const parentCast = await client.getCast(currentCast.inReplyTo.hash);
-            await processThread(parentCast);
+        if (currentCast.message.data.castAddBody.parentCastId) {
+            const message = await client.getCast(
+                currentCast.message.data.castAddBody.parentCastId
+            );
+
+            if (isCastAddMessage(message)) {
+                const parentCast = await client.loadCastFromMessage(message);
+                await processThread(parentCast);
+            }
         }
     }
 
     await processThread(cast);
-    return thread;
 }

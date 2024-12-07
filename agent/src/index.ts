@@ -5,12 +5,10 @@ import { DirectClientInterface } from "@ai16z/client-direct";
 import { DiscordClientInterface } from "@ai16z/client-discord";
 import { TelegramClientInterface } from "@ai16z/client-telegram";
 import { TwitterClientInterface } from "@ai16z/client-twitter";
-import { FarcasterAgentClient } from "@ai16z/client-farcaster";
 import {
     AgentRuntime,
     CacheManager,
     Character,
-    Clients,
     DbCacheAdapter,
     FsCacheAdapter,
     IAgentRuntime,
@@ -32,16 +30,12 @@ import {
     coinbaseCommercePlugin,
     coinbaseMassPaymentsPlugin,
     tradePlugin,
-    tokenContractPlugin,
-    webhookPlugin,
 } from "@ai16z/plugin-coinbase";
 import { confluxPlugin } from "@ai16z/plugin-conflux";
 import { imageGenerationPlugin } from "@ai16z/plugin-image-generation";
 import { evmPlugin } from "@ai16z/plugin-evm";
 import { createNodePlugin } from "@ai16z/plugin-node";
 import { solanaPlugin } from "@ai16z/plugin-solana";
-import { aptosPlugin, TransferAptosToken } from "@ai16z/plugin-aptos";
-import { flowPlugin } from "@ai16z/plugin-flow";
 import { teePlugin } from "@ai16z/plugin-tee";
 import Database from "better-sqlite3";
 import fs from "fs";
@@ -103,6 +97,214 @@ export async function loadCharacters(
 
     if (characterPaths?.length > 0) {
         for (const characterPath of characterPaths) {
+            console.log("characterPath", characterPath);
+            // Handle bodhi protocol format
+            if (characterPath.startsWith("bodhi://")) {
+                try {
+                    const bodhiPostId = characterPath.replace("bodhi://", "");
+                    elizaLogger.info("bodhiPostId", bodhiPostId);
+
+                    let postNumbers: number[] = [];
+
+                    // Check if the input has plus symbol
+                    if (bodhiPostId.includes("+")) {
+                        // Split by + and convert each part to number
+                        postNumbers = bodhiPostId
+                            .split("+")
+                            .map((num) => parseInt(num.trim()));
+                    } else {
+                        // Single number case
+                        postNumbers = [parseInt(bodhiPostId)];
+                    }
+
+                    // Filter out any NaN values
+                    postNumbers = postNumbers.filter((num) => !isNaN(num));
+
+                    elizaLogger.info("postNumbers", postNumbers);
+
+                    let mergedCharacterData: Character | null = null;
+
+                    // Fetch data for each post number individually
+                    for (const postNumber of postNumbers) {
+                        const response = await fetch(
+                            `https://bodhi-data.deno.dev/assets?asset_begin=${postNumber}&asset_end=${postNumber}`
+                        );
+                        const data = await response.json();
+
+                        if (data.assets?.[0]?.content) {
+                            // Process each post's content
+                            const content = data.assets[0].content;
+
+                            // Remove first and last line (which contain ```json and ```)
+                            const contentLines = content.split("\n");
+                            const jsonContent = contentLines
+                                .slice(1, -1) // Remove first and last lines
+                                .join("\n")
+                                .replace(/\r\n/g, "") // Remove any \r\n
+                                .replace(/\r/g, ""); // Remove any \r
+
+                            // Add this: Convert invalid JSON to valid JSON by adding quotes to keys
+                            let validJsonContent = jsonContent.replace(
+                                /(\s*?{\s*?|\s*?,\s*?)(['"])?([a-zA-Z0-9_]+)(['"])?:/g,
+                                '$1"$3":'
+                            );
+
+                            // Remove trailing commas from arrays and objects
+                            validJsonContent = validJsonContent.replace(
+                                /,(\s*[}\]])/g,
+                                "$1"
+                            ); // Remove trailing commas
+
+                            try {
+                                const characterData =
+                                    JSON.parse(validJsonContent);
+                                elizaLogger.info(
+                                    "characterData.username",
+                                    characterData.username
+                                );
+
+                                // Initialize merged data structure if this is the first post
+                                if (!mergedCharacterData) {
+                                    mergedCharacterData = {
+                                        ...characterData,
+                                        lore: [],
+                                        bio: [],
+                                        messageExamples: [],
+                                        postExamples: [],
+                                        topics: [],
+                                        adjectives: [],
+                                    };
+                                }
+
+                                // Merge arrays if they exist, ensuring no duplicates
+                                if (Array.isArray(characterData.lore)) {
+                                    mergedCharacterData.lore.push(
+                                        ...characterData.lore
+                                    );
+                                }
+                                if (Array.isArray(characterData.bio)) {
+                                    mergedCharacterData.bio.push(
+                                        ...characterData.bio
+                                    );
+                                }
+                                if (
+                                    Array.isArray(characterData.messageExamples)
+                                ) {
+                                    mergedCharacterData.messageExamples.push(
+                                        ...characterData.messageExamples
+                                    );
+                                }
+                                if (Array.isArray(characterData.postExamples)) {
+                                    mergedCharacterData.postExamples.push(
+                                        ...characterData.postExamples
+                                    );
+                                }
+                                if (Array.isArray(characterData.topics)) {
+                                    mergedCharacterData.topics.push(
+                                        ...characterData.topics
+                                    );
+                                }
+                                if (Array.isArray(characterData.adjectives)) {
+                                    mergedCharacterData.adjectives.push(
+                                        ...characterData.adjectives
+                                    );
+                                }
+
+                                // If this is the last post, process the final merged data
+                                if (
+                                    postNumber ===
+                                    postNumbers[postNumbers.length - 1]
+                                ) {
+                                    // Remove duplicates from arrays
+                                    mergedCharacterData.lore = [
+                                        ...new Set(mergedCharacterData.lore),
+                                    ];
+                                    mergedCharacterData.bio = [
+                                        ...new Set(mergedCharacterData.bio),
+                                    ];
+                                    mergedCharacterData.messageExamples = [
+                                        ...new Set(
+                                            mergedCharacterData.messageExamples
+                                        ),
+                                    ];
+                                    mergedCharacterData.postExamples = [
+                                        ...new Set(
+                                            mergedCharacterData.postExamples
+                                        ),
+                                    ];
+                                    mergedCharacterData.topics = [
+                                        ...new Set(mergedCharacterData.topics),
+                                    ];
+                                    mergedCharacterData.adjectives = [
+                                        ...new Set(
+                                            mergedCharacterData.adjectives
+                                        ),
+                                    ];
+
+                                    // Add default settings
+                                    mergedCharacterData.modelProvider =
+                                        "redpill";
+                                    mergedCharacterData.plugins = [];
+                                    mergedCharacterData.clients = [];
+                                    mergedCharacterData.settings = {
+                                        secrets: {},
+                                        voice: {
+                                            model: "en_US-hfc_female-medium",
+                                        },
+                                    };
+
+                                    // Save the merged character data
+                                    const characterFileName = `${mergedCharacterData.username}.character.json`;
+                                    const characterFilePath = path.resolve(
+                                        __dirname,
+                                        "../../characters",
+                                        characterFileName
+                                    );
+
+                                    fs.mkdirSync(
+                                        path.dirname(characterFilePath),
+                                        {
+                                            recursive: true,
+                                        }
+                                    );
+                                    fs.writeFileSync(
+                                        characterFilePath,
+                                        JSON.stringify(
+                                            mergedCharacterData,
+                                            null,
+                                            2
+                                        )
+                                    );
+                                    validateCharacterConfig(
+                                        mergedCharacterData
+                                    );
+                                    loadedCharacters.push(mergedCharacterData);
+                                    elizaLogger.info(
+                                        `Successfully loaded character from Bodhi post #${postNumber}`
+                                    );
+                                }
+                            } catch (e) {
+                                elizaLogger.error(
+                                    `Error parsing character data from Bodhi post #${postNumber}: ${e}`
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Add support link to lore
+                    mergedCharacterData.lore.push(
+                        `The support page is https://bodhi.wtf/${postNumbers[0]}?action=buy`
+                    );
+                    continue;
+                } catch (e) {
+                    elizaLogger.error(
+                        `Error processing bodhi URL ${characterPath}: ${e}`
+                    );
+                    continue;
+                }
+            }
+
             let content = null;
             let resolvedPath = "";
 
@@ -328,12 +530,6 @@ export async function initializeClients(
         clients.push(twitterClients);
     }
 
-    if (clientTypes.includes("farcaster")) {
-        const farcasterClients = new FarcasterAgentClient(runtime);
-        farcasterClients.start();
-        clients.push(farcasterClients);
-    }
-
     if (character.plugins?.length > 0) {
         for (const plugin of character.plugins) {
             if (plugin.clients) {
@@ -400,20 +596,10 @@ export function createAgent(
                 : null,
             ...(getSecret(character, "COINBASE_API_KEY") &&
             getSecret(character, "COINBASE_PRIVATE_KEY")
-                ? [coinbaseMassPaymentsPlugin, tradePlugin, tokenContractPlugin]
+                ? [coinbaseMassPaymentsPlugin, tradePlugin]
                 : []),
-            getSecret(character, "COINBASE_API_KEY") &&
-            getSecret(character, "COINBASE_PRIVATE_KEY") &&
-            getSecret(character, "COINBASE_NOTIFICATION_URI")
-                ? webhookPlugin
-                : null,
             getSecret(character, "WALLET_SECRET_SALT") ? teePlugin : null,
             getSecret(character, "ALCHEMY_API_KEY") ? goatPlugin : null,
-            getSecret(character, "FLOW_ADDRESS") &&
-            getSecret(character, "FLOW_PRIVATE_KEY")
-                ? flowPlugin
-                : null,
-            getSecret(character, "APTOS_PRIVATE_KEY") ? aptosPlugin : null,
         ].filter(Boolean),
         providers: [],
         actions: [],
